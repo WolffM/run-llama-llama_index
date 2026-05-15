@@ -268,11 +268,11 @@ class GoogleGenAIEmbedding(BaseEmbedding):
         # of one embedding per input text.
         # NOTE: this results in N sequential API calls instead of one batched
         # call; revisit if the SDK adds a proper per-text batching API.
-        def make_embed_fn(t: str) -> Callable[[], List[List[float]]]:
+        def make_embed_fn(input_text: str) -> Callable[[], List[List[float]]]:
             def embed_with_client() -> List[List[float]]:
                 results = self._client.models.embed_content(
                     model=self.model_name,
-                    contents=t,
+                    contents=input_text,
                     config=embedding_config,
                 )
                 return [result.values for result in results.embeddings]
@@ -309,11 +309,11 @@ class GoogleGenAIEmbedding(BaseEmbedding):
         # introduced in google-genai SDK v1.71.0+ (see sync version for detail).
         # asyncio.gather() is used so that all per-text requests are issued
         # concurrently rather than sequentially.
-        async def embed_single(t: str) -> List[float]:
+        async def embed_single(input_text: str) -> List[float]:
             async def aembed_with_client() -> List[List[float]]:
                 results = await self._client.aio.models.embed_content(
                     model=self.model_name,
-                    contents=t,
+                    contents=input_text,
                     config=embedding_config,
                 )
                 return [result.values for result in results.embeddings]
