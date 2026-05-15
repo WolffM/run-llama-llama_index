@@ -285,6 +285,98 @@ def test_no_retry_on_auth_error(mock_client_class):
 
 
 @patch("google.genai.Client")
+def test_batch_embed_calls_embed_content_per_text(mock_client_class):
+    """Test that batch embedding calls embed_content once per text.
+
+    In google-genai SDK v1.71.0+, passing a list of strings to `contents`
+    aggregates them into a single embedding.  The fix is to call embed_content
+    individually for each text so we always get one embedding per input.
+    """
+    mock_client = mock_client_class.return_value
+    mock_models = mock_client.models
+    mock_embed_content = mock_models.embed_content
+
+    # Each call returns a distinct embedding so we can verify they are kept separate
+    def make_result(values):
+        mock_embedding = MagicMock()
+        mock_embedding.values = values
+        mock_result = MagicMock()
+        mock_result.embeddings = [mock_embedding]
+        return mock_result
+
+    mock_embed_content.side_effect = [
+        make_result([0.1, 0.2, 0.3]),
+        make_result([0.4, 0.5, 0.6]),
+        make_result([0.7, 0.8, 0.9]),
+    ]
+
+    texts = ["first text", "second text", "third text"]
+    emb = GoogleGenAIEmbedding(api_key="fake_key")
+    result = emb.get_text_embedding_batch(texts)
+
+    # Should have one embedding per input text
+    assert len(result) == 3
+    assert result[0] == [0.1, 0.2, 0.3]
+    assert result[1] == [0.4, 0.5, 0.6]
+    assert result[2] == [0.7, 0.8, 0.9]
+
+    # embed_content must have been called once per text (not once with a list)
+    assert mock_embed_content.call_count == 3
+
+    # Each call must receive a single string, not a list
+    for call in mock_embed_content.call_args_list:
+        _, kwargs = call
+        assert isinstance(kwargs.get("contents"), str)
+
+
+@pytest.mark.asyncio
+@patch("google.genai.Client")
+async def test_async_batch_embed_calls_embed_content_per_text(mock_client_class):
+    """Test that async batch embedding calls embed_content once per text.
+
+    Mirrors the sync test above for the async code path.
+    """
+    mock_client = mock_client_class.return_value
+    mock_aio = MagicMock()
+    mock_client.aio = mock_aio
+    mock_aio_models = mock_aio.models
+
+    def make_result(values):
+        mock_embedding = MagicMock()
+        mock_embedding.values = values
+        mock_result = MagicMock()
+        mock_result.embeddings = [mock_embedding]
+        return mock_result
+
+    mock_aembed_content = AsyncMock(
+        side_effect=[
+            make_result([0.1, 0.2, 0.3]),
+            make_result([0.4, 0.5, 0.6]),
+            make_result([0.7, 0.8, 0.9]),
+        ]
+    )
+    mock_aio_models.embed_content = mock_aembed_content
+
+    texts = ["first text", "second text", "third text"]
+    emb = GoogleGenAIEmbedding(api_key="fake_key")
+    result = await emb.aget_text_embedding_batch(texts)
+
+    # Should have one embedding per input text
+    assert len(result) == 3
+    assert result[0] == [0.1, 0.2, 0.3]
+    assert result[1] == [0.4, 0.5, 0.6]
+    assert result[2] == [0.7, 0.8, 0.9]
+
+    # embed_content must have been called once per text
+    assert mock_aembed_content.call_count == 3
+
+    # Each call must receive a single string, not a list
+    for call in mock_aembed_content.call_args_list:
+        _, kwargs = call
+        assert isinstance(kwargs.get("contents"), str)
+
+
+@patch("google.genai.Client")
 def test_client_header_initialization(mock_client_class):
     """Test that the client header is correctly passed to the GoogleGenAIEmbedding."""
     # Setup mock client

@@ -9,6 +9,7 @@ from tenacity import (
     retry_if_exception,
     AsyncRetrying,
 )
+import asyncio
 from typing import Any, Dict, List, Optional, TypedDict, Callable, TypeVar, Awaitable
 
 import requests
@@ -260,25 +261,36 @@ class GoogleGenAIEmbedding(BaseEmbedding):
         else:
             embedding_config = self.embedding_config
 
-        # Create the embedding function with retry logic
-        def embed_with_client() -> List[List[float]]:
-            results = self._client.models.embed_content(
-                model=self.model_name,
-                contents=texts,
-                config=embedding_config,
+        # Create the embedding function with retry logic.
+        # Each text is embedded individually to avoid the aggregation behavior
+        # introduced in google-genai SDK v1.71.0+, where passing a list of
+        # strings to `contents` returns a single aggregated embedding instead
+        # of one embedding per input text.
+        # NOTE: this results in N sequential API calls instead of one batched
+        # call; revisit if the SDK adds a proper per-text batching API.
+        def make_embed_fn(input_text: str) -> Callable[[], List[List[float]]]:
+            def embed_with_client() -> List[List[float]]:
+                results = self._client.models.embed_content(
+                    model=self.model_name,
+                    contents=input_text,
+                    config=embedding_config,
+                )
+                return [result.values for result in results.embeddings]
+
+            return embed_with_client
+
+        all_embeddings: List[List[float]] = []
+        for text in texts:
+            retryable_embed = get_retryable_function(
+                make_embed_fn(text),
+                max_retries=self.retries,
+                min_seconds=self.retry_min_seconds,
+                max_seconds=self.retry_max_seconds,
+                exponential_base=self.retry_exponential_base,
             )
-            return [result.values for result in results.embeddings]
+            all_embeddings.extend(retryable_embed())
 
-        # Apply the retry decorator
-        retryable_embed = get_retryable_function(
-            embed_with_client,
-            max_retries=self.retries,
-            min_seconds=self.retry_min_seconds,
-            max_seconds=self.retry_max_seconds,
-            exponential_base=self.retry_exponential_base,
-        )
-
-        return retryable_embed()
+        return all_embeddings
 
     async def _aembed_texts(
         self, texts: List[str], task_type: Optional[str] = None
@@ -293,23 +305,31 @@ class GoogleGenAIEmbedding(BaseEmbedding):
         else:
             embedding_config = self.embedding_config
 
-        # Create the async embedding function with retry logic
-        async def aembed_with_client() -> List[List[float]]:
-            results = await self._client.aio.models.embed_content(
-                model=self.model_name,
-                contents=texts,
-                config=embedding_config,
-            )
-            return [result.values for result in results.embeddings]
+        # Embed each text individually to avoid the aggregation behavior
+        # introduced in google-genai SDK v1.71.0+ (see sync version for detail).
+        # asyncio.gather() is used so that all per-text requests are issued
+        # concurrently rather than sequentially.
+        async def embed_single(input_text: str) -> List[float]:
+            async def aembed_with_client() -> List[List[float]]:
+                results = await self._client.aio.models.embed_content(
+                    model=self.model_name,
+                    contents=input_text,
+                    config=embedding_config,
+                )
+                return [result.values for result in results.embeddings]
 
-        # Apply the async retry helper
-        return await get_retryable_async_function(
-            aembed_with_client,
-            max_retries=self.retries,
-            min_seconds=self.retry_min_seconds,
-            max_seconds=self.retry_max_seconds,
-            exponential_base=self.retry_exponential_base,
-        )
+            embeddings = await get_retryable_async_function(
+                aembed_with_client,
+                max_retries=self.retries,
+                min_seconds=self.retry_min_seconds,
+                max_seconds=self.retry_max_seconds,
+                exponential_base=self.retry_exponential_base,
+            )
+            # embed_content returns one embedding when given a single string
+            return embeddings[0]
+
+        per_text = await asyncio.gather(*[embed_single(t) for t in texts])
+        return list(per_text)
 
     def _get_query_embedding(self, query: str) -> List[float]:
         """Get query embedding."""
