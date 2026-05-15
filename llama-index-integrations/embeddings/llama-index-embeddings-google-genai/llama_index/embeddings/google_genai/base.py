@@ -9,6 +9,7 @@ from tenacity import (
     retry_if_exception,
     AsyncRetrying,
 )
+import asyncio
 from typing import Any, Dict, List, Optional, TypedDict, Callable, TypeVar, Awaitable
 
 import requests
@@ -265,10 +266,10 @@ class GoogleGenAIEmbedding(BaseEmbedding):
         # introduced in google-genai SDK v1.71.0+, where passing a list of
         # strings to `contents` returns a single aggregated embedding instead
         # of one embedding per input text.
-        all_embeddings: List[List[float]] = []
-        for text in texts:
-
-            def embed_with_client(t: str = text) -> List[List[float]]:
+        # NOTE: this results in N sequential API calls instead of one batched
+        # call; revisit if the SDK adds a proper per-text batching API.
+        def make_embed_fn(t: str) -> Callable[[], List[List[float]]]:
+            def embed_with_client() -> List[List[float]]:
                 results = self._client.models.embed_content(
                     model=self.model_name,
                     contents=t,
@@ -276,8 +277,12 @@ class GoogleGenAIEmbedding(BaseEmbedding):
                 )
                 return [result.values for result in results.embeddings]
 
+            return embed_with_client
+
+        all_embeddings: List[List[float]] = []
+        for text in texts:
             retryable_embed = get_retryable_function(
-                embed_with_client,
+                make_embed_fn(text),
                 max_retries=self.retries,
                 min_seconds=self.retry_min_seconds,
                 max_seconds=self.retry_max_seconds,
@@ -302,10 +307,10 @@ class GoogleGenAIEmbedding(BaseEmbedding):
 
         # Embed each text individually to avoid the aggregation behavior
         # introduced in google-genai SDK v1.71.0+ (see sync version for detail).
-        all_embeddings: List[List[float]] = []
-        for text in texts:
-
-            async def aembed_with_client(t: str = text) -> List[List[float]]:
+        # asyncio.gather() is used so that all per-text requests are issued
+        # concurrently rather than sequentially.
+        async def embed_single(t: str) -> List[float]:
+            async def aembed_with_client() -> List[List[float]]:
                 results = await self._client.aio.models.embed_content(
                     model=self.model_name,
                     contents=t,
@@ -320,9 +325,11 @@ class GoogleGenAIEmbedding(BaseEmbedding):
                 max_seconds=self.retry_max_seconds,
                 exponential_base=self.retry_exponential_base,
             )
-            all_embeddings.extend(embeddings)
+            # embed_content returns one embedding when given a single string
+            return embeddings[0]
 
-        return all_embeddings
+        per_text = await asyncio.gather(*[embed_single(t) for t in texts])
+        return list(per_text)
 
     def _get_query_embedding(self, query: str) -> List[float]:
         """Get query embedding."""
